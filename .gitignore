@@ -1,0 +1,7 @@
+# local settings with the MQTT password
+config.json
+litra-mqtt.log*
+.venv/
+__pycache__/
+.DS_Store
+Thumbs.db

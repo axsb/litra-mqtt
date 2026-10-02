@@ -1,0 +1,6 @@
+{
+  "host": "homeassistant.local",
+  "port": 1883,
+  "username": "litra",
+  "password": "change-me"
+}

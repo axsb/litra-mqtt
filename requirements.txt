@@ -1,0 +1,2 @@
+hidapi>=0.14
+paho-mqtt>=2.0
