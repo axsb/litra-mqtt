@@ -14,6 +14,7 @@ import queue
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -38,6 +39,12 @@ QUERIES = (GET_POWER, GET_BRIGHTNESS, GET_TEMP)
 
 DEFAULTS = {"port": 1883, "username": None, "password": None,
             "poll_seconds": 30, "discovery_prefix": "homeassistant"}
+
+# paho can end up dead without noticing (see check_mqtt), so the bridge checks the broker
+# connection end to end: a heartbeat with QoS 1 must be acknowledged in time.
+HEARTBEAT_SECONDS = 60
+ACK_TIMEOUT_SECONDS = 30
+MAX_OFFLINE_SECONDS = 300
 
 
 def single_instance(name):
@@ -89,24 +96,89 @@ class Bridge:
         # Per host, so bridges on several PCs neither kick each other off the broker
         # nor overwrite each other's status.
         self.bridge_topic = f"litra/bridge/{hostname}"
-        self.mqtt = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"litra-mqtt-{hostname}")
-        if cfg["username"]:
-            self.mqtt.username_pw_set(cfg["username"], cfg["password"])
-        self.mqtt.will_set(self.bridge_topic, "offline", retain=True)
-        self.mqtt.reconnect_delay_set(1, 60)
-        self.mqtt.on_connect = self.on_connect
-        self.mqtt.on_disconnect = self.on_disconnect
-        self.mqtt.on_message = self.on_message
+        self.client_id = f"litra-mqtt-{hostname}"
+        self.mqtt = None
+        self.start_mqtt()
 
     # --- MQTT ---------------------------------------------------------------
+
+    def start_mqtt(self):
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id)
+        # An exception in a callback would otherwise end paho's network thread for good.
+        client.suppress_exceptions = True
+        client.enable_logger(logging.getLogger("paho"))
+        if self.cfg["username"]:
+            client.username_pw_set(self.cfg["username"], self.cfg["password"])
+        client.will_set(self.bridge_topic, "offline", retain=True)
+        client.reconnect_delay_set(1, 60)
+        client.on_connect = self.on_connect
+        client.on_disconnect = self.on_disconnect
+        client.on_message = self.on_message
+        # Swap in the new client before it starts: on_connect publishes through self.mqtt.
+        self.mqtt = client
+        self.mqtt_broken = False
+        self.heartbeat = None
+        self.heartbeat_sent = time.monotonic()
+        self.offline_since = None
+        client.connect_async(self.cfg["host"], self.cfg["port"], keepalive=30)
+        client.loop_start()
+
+    def restart_mqtt(self, reason):
+        log.warning("Restarting the MQTT client: %s", reason)
+        old = self.mqtt
+        for step in (old.loop_stop, old.disconnect):
+            try:
+                step()
+            except Exception:
+                pass  # the old client is broken anyway
+        self.start_mqtt()
+
+    def check_mqtt(self):
+        """Replace the MQTT client when it stopped working.
+
+        paho wakes its network thread through a local socket pair that it creates only once.
+        On Windows, standby or a network change can tear that pair down; from then on every
+        publish raises WinError 10053 and the network thread may die silently while
+        is_connected() still reports True. paho never recovers from this by itself.
+        """
+        now = time.monotonic()
+        if self.mqtt_broken:
+            self.restart_mqtt("sending failed")
+        elif self.mqtt.is_connected():
+            self.offline_since = None
+            if (self.heartbeat is not None and not self.heartbeat.is_published()
+                    and now - self.heartbeat_sent > ACK_TIMEOUT_SECONDS):
+                self.restart_mqtt("the broker stopped acknowledging")
+            elif now - self.heartbeat_sent >= HEARTBEAT_SECONDS:
+                self.heartbeat = self.publish(self.bridge_topic, "online", retain=True, qos=1)
+                self.heartbeat_sent = now
+        elif self.offline_since is None:
+            self.offline_since = now
+        elif now - self.offline_since > MAX_OFFLINE_SECONDS:
+            self.restart_mqtt(f"no connection for {MAX_OFFLINE_SECONDS // 60} minutes")
+
+    def publish(self, topic, payload, retain=False, qos=0):
+        """Publish without ever raising; a failure marks the client for replacement."""
+        try:
+            return self.mqtt.publish(topic, payload, qos=qos, retain=retain)
+        except Exception as e:
+            if not self.mqtt_broken:
+                log.warning("MQTT publish failed: %s", e)
+            self.mqtt_broken = True
+            return None
 
     def on_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code.is_failure:
             log.error("MQTT connection refused: %s", reason_code)
             return
         log.info("MQTT connected")
-        client.publish(self.bridge_topic, "online", retain=True)
-        client.subscribe([("litra/+/set", 0), (f"{self.cfg['discovery_prefix']}/status", 0)])
+        self.publish(self.bridge_topic, "online", retain=True)
+        try:
+            client.subscribe([("litra/+/set", 0), (f"{self.cfg['discovery_prefix']}/status", 0)])
+        except Exception as e:
+            log.warning("MQTT subscribe failed: %s", e)
+            self.mqtt_broken = True
+            return
         self.announce()
 
     def on_disconnect(self, client, userdata, flags, reason_code, properties):
@@ -177,8 +249,8 @@ class Bridge:
             "origin": {"name": "litra-mqtt", "support_url": "https://github.com/axsb/litra-mqtt"},
         }
         topic = f"{self.cfg['discovery_prefix']}/light/litra_{serial}/config"
-        self.mqtt.publish(topic, json.dumps(config), retain=True)
-        self.mqtt.publish(f"{base}/availability", "online", retain=True)
+        self.publish(topic, json.dumps(config), retain=True)
+        self.publish(f"{base}/availability", "online", retain=True)
         self.publish_state(force=True)
 
     def publish_state(self, force=False):
@@ -195,7 +267,7 @@ class Bridge:
             return
         self.last_state = payload
         log.info("State: %s, %d lm, %d K", payload["state"], s["lm"], s["k"])
-        self.mqtt.publish(f"{light['base']}/state", json.dumps(payload), retain=True)
+        self.publish(f"{light['base']}/state", json.dumps(payload), retain=True)
 
     # --- USB ----------------------------------------------------------------
 
@@ -221,6 +293,7 @@ class Bridge:
 
     def device_loop(self):
         while True:
+            self.check_mqtt()
             info = self.find()
             if info is None:
                 time.sleep(5)
@@ -246,6 +319,7 @@ class Bridge:
             next_poll = time.monotonic() + self.cfg["poll_seconds"]
             try:
                 while True:
+                    self.check_mqtt()
                     # At most one command per round; waiting for the reply paces fast sequences.
                     try:
                         function, value = self.cmds.get_nowait()
@@ -260,14 +334,28 @@ class Bridge:
                         next_poll = time.monotonic() + self.cfg["poll_seconds"]
                         for q in QUERIES:
                             self.cmds.put((q, 0))
-            except (OSError, ValueError) as e:
+            except (OSError, ValueError) as e:  # only USB errors get here; publish() never raises
                 log.warning("Lost the light: %s", e)
             finally:
                 dev.close()
-                if self.mqtt.is_connected():
-                    self.mqtt.publish(f"{self.light['base']}/availability", "offline", retain=True)
+                self.publish(f"{self.light['base']}/availability", "offline", retain=True)
                 self.light = None
                 time.sleep(2)
+
+    def shutdown(self):
+        try:
+            info = self.publish(self.bridge_topic, "offline", retain=True)
+            if info is not None and self.mqtt.is_connected():
+                info.wait_for_publish(2)
+            self.mqtt.disconnect()
+            self.mqtt.loop_stop()
+        except Exception:
+            pass  # the will message reports the bridge as offline anyway
+
+
+def log_thread_crash(args):
+    log.error("Thread %s crashed", getattr(args.thread, "name", "?"),
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
 def main():
@@ -277,21 +365,20 @@ def main():
     args = parser.parse_args()
 
     setup_logging(args.config.parent / "litra-mqtt.log")
+    threading.excepthook = log_thread_crash  # pythonw.exe would swallow the traceback
     lock = single_instance("litra-mqtt")  # noqa: F841 - must stay alive until exit
     cfg = DEFAULTS | json.loads(args.config.read_text(encoding="utf-8"))
-    bridge = Bridge(cfg)
     log.info("Starting, broker %s:%s", cfg["host"], cfg["port"])
-    bridge.mqtt.connect_async(cfg["host"], cfg["port"], keepalive=30)
-    bridge.mqtt.loop_start()
+    bridge = Bridge(cfg)
     try:
         bridge.device_loop()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        log.exception("Bridge crashed")
+        raise SystemExit(1)
     finally:
-        if bridge.mqtt.is_connected():
-            bridge.mqtt.publish(bridge.bridge_topic, "offline", retain=True).wait_for_publish(2)
-        bridge.mqtt.disconnect()
-        bridge.mqtt.loop_stop()
+        bridge.shutdown()
 
 
 if __name__ == "__main__":

@@ -128,15 +128,18 @@ the entity `light.litra_glow` appears. Stop the bridge with Ctrl+C.
 ### 5. Start automatically
 
 **Windows:** a scheduled task starts the bridge at logon with `pythonw.exe`, so no console
-window appears. It runs in your user session and needs no admin rights. In PowerShell, from
-the repository folder:
+window appears. It runs in your user session and needs no admin rights. A second trigger
+checks every 5 minutes and restarts the bridge if it is not running; while it runs, the
+check does nothing. On a laptop that mostly sleeps instead of shutting down, logon alone is
+not enough. In PowerShell, from the repository folder:
 
 ```powershell
 $dir = (Resolve-Path .).Path; $user = "$env:USERDOMAIN\$env:USERNAME"
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user; $trigger.Delay = "PT15S"
-Register-ScheduledTask -TaskName "litra-mqtt" -Force -Trigger $trigger `
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $user; $logon.Delay = "PT15S"
+$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName "litra-mqtt" -Force -Trigger @($logon, $watchdog) `
   -Action (New-ScheduledTaskAction -Execute "$dir\.venv\Scripts\pythonw.exe" -Argument "`"$dir\litra_mqtt.py`"" -WorkingDirectory $dir) `
-  -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)) `
+  -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) `
   -Principal (New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited)
 Start-ScheduledTask -TaskName "litra-mqtt"
 ```
@@ -217,6 +220,10 @@ The log is `litra-mqtt.log` next to `config.json`.
   The Beam LX is not supported.
 - **`Another bridge is already running`**: only one bridge per computer. Bridges on different
   computers do not interfere with each other.
+- **`Restarting the MQTT client` after sleep or a network change**: expected. On Windows,
+  paho-mqtt can lose the local socket pair it uses internally and never recover by itself,
+  so the bridge sends a heartbeat every minute and replaces the client when sending fails or
+  the broker stops acknowledging.
 
 ## Contributing
 
