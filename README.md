@@ -35,7 +35,7 @@ litra-mqtt is the missing small piece: USB on one side, MQTT discovery on the ot
 | Light | USB ID | Status |
 |---|---|---|
 | Litra Glow | `046d:c900` | tested |
-| Litra Beam | `046d:c901` | same protocol, untested |
+| Litra Beam | `046d:c901` | tested |
 | Litra Beam LX | `046d:c903` | not supported (different protocol) |
 
 USB only. One light per bridge: if several are connected, the first one found is used.
@@ -194,7 +194,7 @@ are 20-byte reports of the form `11 FF 04 <function> <value hi> <value lo>`:
 
 The light acknowledges set commands without echoing the value, so the bridge reads the state
 back after each command. It also understands the unsolicited change reports, but does not rely
-on them: the Glow did not send any in testing, so the bridge polls as well.
+on them: the Beam sends them, the Glow did not send any in testing, so the bridge polls as well.
 
 MQTT topics:
 
@@ -227,7 +227,7 @@ The log is `litra-mqtt.log` next to `config.json`.
 
 ## Contributing
 
-Not tested yet, and contributions welcome: Litra Beam, Linux, macOS, and more than one light per bridge.
+Not tested yet, and contributions welcome: Linux, macOS, and more than one light per bridge.
 
 ## Credits
 
